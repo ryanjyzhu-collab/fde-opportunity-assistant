@@ -66,21 +66,26 @@ def _read_streamlit_secret(name: str) -> str:
     return str(value or "").strip()
 
 
-def _get_api_key() -> str:
-    """Read a DeepSeek key without exposing it to another browser session.
+def _get_managed_api_key() -> str:
+    """Return a server-managed key, if the deployment provides one.
 
-    `DASHSCOPE_API_KEY` remains a temporary compatibility fallback for an
-    earlier demo build.  New deployments must use `DEEPSEEK_API_KEY`.
+    A managed key must never be paired with visitor-configurable endpoint or
+    model settings. Otherwise, a public-app visitor could redirect the request
+    to a server they control and receive the Authorization header.
     """
     for key in (
         _read_streamlit_secret("DEEPSEEK_API_KEY"),
         os.environ.get("DEEPSEEK_API_KEY", "").strip(),
         os.environ.get("DASHSCOPE_API_KEY", "").strip(),
-        str(st.session_state.get("_api_key", "")).strip(),
     ):
         if key:
             return key
     return ""
+
+
+def _get_api_key() -> str:
+    """Return the deployment key, or a key supplied only for this session."""
+    return _get_managed_api_key() or str(st.session_state.get("_api_key", "")).strip()
 
 
 # ──────────────────────────────────────────────
@@ -306,13 +311,15 @@ def _call_llm_real(system_prompt: str, user_prompt: str, *, json_mode: bool = Fa
 
         client = OpenAI(
             api_key=api_key,
-            base_url=st.session_state.get("base_url_config", BASE_URL).strip() or BASE_URL,
+            # Never accept an endpoint from a browser session. The OpenAI client
+            # sends the API key as an Authorization header to this base URL.
+            base_url=BASE_URL,
             timeout=LLM_TIMEOUT_SECONDS,
             max_retries=LLM_MAX_RETRIES,
         )
 
         request_options = {
-            "model": st.session_state.get("model_name_config", MODEL_NAME).strip() or MODEL_NAME,
+            "model": MODEL_NAME,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -1455,18 +1462,20 @@ def main():
     with st.sidebar:
         st.header("⚙️ 配置")
         use_mock = st.checkbox("使用 Mock 模式（不调用真实API）", value=True, help="开启后使用本地模拟数据，无需 API Key")
-        api_key = st.text_input(
-            "DeepSeek API Key",
-            type="password",
-            value="",
-            key="api_key_input",
-            placeholder="仅当前浏览器会话使用",
-            help="优先使用 Streamlit Secrets 或环境变量 DEEPSEEK_API_KEY；此处输入仅保留在当前会话。",
-        )
-        base_url = st.text_input("Base URL", value=BASE_URL, key="base_url_config", help="DeepSeek OpenAI 兼容接口地址")
-        model_name = st.text_input("Model", value=MODEL_NAME, key="model_name_config", help="关闭 Mock 模式后实际调用的模型名称")
-        if api_key:
-            st.session_state._api_key = api_key.strip()
+        if _get_managed_api_key():
+            st.caption("真实 API 已由服务端安全配置。")
+            api_key = ""
+        else:
+            api_key = st.text_input(
+                "DeepSeek API Key",
+                type="password",
+                value="",
+                key="api_key_input",
+                placeholder="仅当前浏览器会话使用",
+                help="仅用于本地或自管部署；公开应用请在服务端配置 DEEPSEEK_API_KEY。",
+            )
+            if api_key:
+                st.session_state._api_key = api_key.strip()
 
         st.divider()
         st.header("📋 核心分析规则")
