@@ -375,8 +375,10 @@ def call_extractor(
     source_text = transcript
     if preprocessed_summary:
         source_text = (
-            "【原始转写（quote 必须仅引用这里的原话）】\n"
-            f"{transcript}\n\n【预处理事实摘要】\n{preprocessed_summary}"
+            "【预处理事实摘要（仅用于定位字段，不得直接作为 quote）】\n"
+            f"{preprocessed_summary}\n\n"
+            "【原始转写（唯一事实与 quote 来源；所有非空字段必须逐字引用这里）】\n"
+            f"{transcript}"
         )
     result_text = _call_llm_real(
         "", EXTRACTOR_PROMPT.format(transcript=source_text), json_mode=True
@@ -1002,7 +1004,7 @@ def _recover_qualified_timeline(source_text: str) -> dict | None:
 
 
 FOLLOW_UP_ACTION_PATTERN = re.compile(
-    r"(?:下一步|后续|回头|我(?:们)?(?:先|会|来|安排|跟进|联系|找|约|发|带)|"
+    r"(?:下一步|后续|回头|我(?:们)?(?:先|会|来|打算|安排|跟进|联系|找|约|发|带)|"
     r"(?:等|到)?(?:本周|下周|下个月|明天|后天).{0,20}(?:安排|跟进|联系|找|约|发|带|提交|同步|拉))"
 )
 
@@ -1051,7 +1053,14 @@ def _stage_evidence_from_source(data: dict, source_text: str) -> dict:
             candidate = raw_evidence.get(key, {})
             if isinstance(candidate, dict) and candidate.get("met"):
                 quote = candidate.get("quote")
-                if _quote_is_grounded(quote, source_text):
+                # A sales question or a customer's "我猜 / 可能" answer is
+                # not commercial evaluation. It must not promote a deal to
+                # S3 simply because it happens to mention a budget figure.
+                commercial_guess = key == "commercial_evaluation" and any(
+                    term in str(quote or "")
+                    for term in (*UNCERTAIN_TERMS, "不好说", "没法给个准数")
+                )
+                if _quote_is_grounded(quote, source_text) and not commercial_guess:
                     evidence[key] = {"met": True, "quote": str(quote).strip()}
 
     # A need or scenario that has already passed the fact-boundary test is
@@ -1064,9 +1073,19 @@ def _stage_evidence_from_source(data: dict, source_text: str) -> dict:
                 evidence["need_or_scenario"] = {"met": True, "quote": quote}
                 break
 
+    # Commercial stage evidence must come from an already validated budget
+    # fact or from non-speculative model evidence above. A broad keyword
+    # match on “预算” would incorrectly treat questions and guesses as a
+    # commercial commitment.
+    if not evidence["commercial_evaluation"]["met"]:
+        budget_entry = data.get("budget", {})
+        budget_value = extract_value(budget_entry) if isinstance(budget_entry, dict) else None
+        budget_quote = extract_quote(budget_entry) if isinstance(budget_entry, dict) else None
+        if budget_value and _quote_is_grounded(budget_quote, source_text):
+            evidence["commercial_evaluation"] = {"met": True, "quote": budget_quote}
+
     fallback_patterns = {
         "solution_validation": r"同意.{0,12}(演示|试用|技术交流|方案评估)|安排.{0,12}(演示|试用|技术交流)|测试账号|测试环境|技术交流|方案评估",
-        "commercial_evaluation": r"(预算|报价|采购流程|合同条款).{0,24}(讨论|确认|范围|金额|申请|批复|多少|万|元)|讨论.{0,12}(预算|报价|采购流程|合同条款)",
         "decision_approval": r"立项申请.{0,8}(已|获).{0,4}批|已.{0,8}立项|进入.{0,8}(立项|审批|供应商决策)|供应商.{0,8}(决策|选定|选择)",
         "contract_signed": r"(已签|签订).{0,8}合同|正式订单.{0,8}(已|确认)|订单.{0,8}已确认",
     }
@@ -1149,7 +1168,7 @@ def _build_next_step_plan(data: dict, source_text: str) -> dict:
     # grounded next-step quote; otherwise retain the explicit suggestion/
     # pending labels below.
     plan_quote = str(next_step_quote or "")
-    if not owner and re.search(r"我(?:先|带|来|会|负责|安排|跟进|联系|拉)", plan_quote):
+    if not owner and re.search(r"我(?:先|带|来|会|打算|负责|安排|跟进|联系|拉)", plan_quote):
         owner = "我方销售（记录者）"
     if not owner and re.search(
         r"^\s*等(?:本周|下周|下个月|明天|后天).{0,20}(?:安排|跟进|联系|找|约|发|带|提交|同步|拉)",
