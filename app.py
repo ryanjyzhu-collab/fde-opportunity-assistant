@@ -921,9 +921,48 @@ def _recover_qualified_budget(source_text: str) -> dict | None:
 
 TIME_VALUE_PATTERN = (
     r"(?:约|大概|预计)?\s*"
-    r"(?:本周[一二三四五六日天]?|下周[一二三四五六日天]?|下个月|今年[Qq][1-4]|"
-    r"明年|年底|[Qq][1-4]|\d{1,2}月\d{1,2}[日号]?|\d{1,2}[日号])(?:左右)?"
+    r"(?:(?:本周|这周|下周)[一二三四五六日天]?(?:前)?(?:上午|下午|晚上)?|"
+    r"周[一二三四五六日天](?:上午|下午|晚上)?|下个月|今年[Qq][1-4]|"
+    r"明年|年底|明天|后天|[Qq][1-4]|\d{1,2}月\d{1,2}[日号]?|\d{1,2}[日号])(?:左右)?"
 )
+
+# Dialogue labels are optional metadata in a sales note. When present, they
+# are reliable enough to identify a participant and an explicitly named owner.
+_DIALOGUE_SPEAKER_PATTERN = re.compile(
+    r"(?m)^\s*(?:\*\*)?(?P<label>[^:\n：*]{1,40}?)[：:](?:\*\*)?\s*"
+)
+_SALES_SPEAKER_PATTERN = re.compile(r"(?:售前|销售|商务|客户经理|顾问|我方)")
+
+
+def _dialogue_speaker_labels(source_text: str) -> set[str]:
+    """Return normalized labels only from explicitly labelled dialogue turns."""
+    return {
+        _normalized_evidence_text(match.group("label"))
+        for match in _DIALOGUE_SPEAKER_PATTERN.finditer(source_text)
+        if _normalized_evidence_text(match.group("label"))
+    }
+
+
+def _extract_sales_follow_up_commitment(source_text: str) -> tuple[str | None, list[str]]:
+    """Read a named sales speaker's literal follow-up commitment, if present.
+
+    Unlabelled prose and customer turns are deliberately ignored. Without an
+    explicit sales speaker, the UI must continue to show a suggested owner.
+    """
+    turns = list(_DIALOGUE_SPEAKER_PATTERN.finditer(source_text))
+    for index, turn in enumerate(turns):
+        speaker = turn.group("label").strip()
+        if not _SALES_SPEAKER_PATTERN.search(speaker):
+            continue
+        end = turns[index + 1].start() if index + 1 < len(turns) else len(source_text)
+        utterance = source_text[turn.end() : end]
+        if not FOLLOW_UP_ACTION_PATTERN.search(utterance):
+            continue
+        times = [match.group(0).strip() for match in re.finditer(
+            TIME_VALUE_PATTERN, utterance, flags=re.IGNORECASE
+        )]
+        return speaker, list(dict.fromkeys(times))
+    return None, []
 
 
 def _has_qualified_time(value: object) -> bool:
@@ -1103,6 +1142,7 @@ def _build_next_step_plan(data: dict, source_text: str) -> dict:
 
     owner = supported_component("owner")
     due_time = supported_component("time")
+    source_owner, source_times = _extract_sales_follow_up_commitment(source_text)
 
     # Mock mode and older model responses may not provide the optional plan
     # object.  Recover only literal owner/time mentions from the already
@@ -1131,10 +1171,19 @@ def _build_next_step_plan(data: dict, source_text: str) -> dict:
         # that might have silently dropped “约 / 大概 / 左右”.
         if time_match and (_has_qualified_time(time_match.group(0)) or not due_time):
             due_time = time_match.group(0).strip()
-    time_precision_pending = _has_qualified_time(due_time)
-    displayed_time = due_time
-    if displayed_time and time_precision_pending:
-        displayed_time = f"{displayed_time}（具体日期待确认）"
+    if not owner and source_owner:
+        owner = source_owner
+
+    time_values = [due_time] if due_time else []
+    for source_time in source_times:
+        if source_time not in time_values:
+            time_values.append(source_time)
+    time_precision_pending = any(_has_qualified_time(value) for value in time_values)
+    displayed_values = [
+        f"{value}（具体日期待确认）" if _has_qualified_time(value) else value
+        for value in time_values
+    ]
+    displayed_time = "；".join(displayed_values) or None
     return {
         "action": action or "待确认下一步行动",
         "owner": owner or "我方销售（建议）",
@@ -1219,6 +1268,21 @@ def rule_engine(data: dict, source_text: str = "") -> tuple[dict, list[str], lis
             ))
             short_log.append(f"⚠️ [{field}] 命中不确定表达，已标为未确认")
             rules_applied += 1
+
+    # A speaker label such as “张总（甲方）” identifies a person in a dialogue,
+    # not the customer's legal or trade name. Reject only exact labelled
+    # participants; ordinary company names remain untouched.
+    customer_name = processed.get("customer_name", {})
+    customer_value = extract_value(customer_name) if isinstance(customer_name, dict) else None
+    if customer_value and _normalized_evidence_text(customer_value) in _dialogue_speaker_labels(source_text):
+        processed["customer_name"] = _field_entry()
+        report.append(_report_item(
+            "实体边界", "拦截", "customer_name",
+            "客户名称与原始对话中的参与人标签完全一致，无法作为组织名称确认。",
+            "已改为未确认，等待补充客户公司全称。",
+        ))
+        short_log.append("⚠️ [customer_name] 参与人标签不能作为客户公司名称，已标为未确认")
+        rules_applied += 1
 
     # A customer-stated range such as "大概 80 万" is useful commercial
     # evidence, but never an exact confirmed amount. Preserve the qualifier
@@ -1666,8 +1730,6 @@ def _clear_all_state() -> None:
 
 def _do_run_analysis(transcript: str, input_type: str, use_mock: bool) -> None:
     """Run full pipeline directly (called from within render flow)."""
-    import traceback as tb_mod
-
     st.session_state.processing = True
     # Use progress bar rendered in this same render cycle
     progress_container = st.empty()
@@ -1738,11 +1800,10 @@ def _do_run_analysis(transcript: str, input_type: str, use_mock: bool) -> None:
 
         progress_container.progress(100, "分析完成 ✅")
 
-    except Exception as e:
+    except Exception:
         st.session_state.processing = False
-        progress_container.progress(100, f"⚠️ 分析异常: {type(e).__name__}")
-        st.error(f"分析过程中发生意外错误: {type(e).__name__}: {e}")
-        st.code("".join(tb_mod.format_exception(type(e), e, e.__traceback__)), language="python")
+        progress_container.progress(100, "⚠️ 分析未完成")
+        st.error("分析过程中发生异常，请检查输入后重试。若问题持续，请联系应用维护者。")
 
 
 def _render_progress() -> None:
@@ -1882,7 +1943,8 @@ def _render_extraction_results() -> None:
     if isinstance(next_step_plan, dict):
         with st.expander("📌 下一步行动拆解", expanded=True):
             st.markdown(f"- **动作**：{next_step_plan.get('action', '待确认下一步行动')}")
-            st.markdown(f"- **建议负责人**：{next_step_plan.get('owner', '我方销售（建议）')}")
+            owner_label = "负责人" if next_step_plan.get("owner_confirmed") else "建议负责人"
+            st.markdown(f"- **{owner_label}**：{next_step_plan.get('owner', '我方销售（建议）')}")
             st.markdown(f"- **时间**：{next_step_plan.get('time', '待确认')}")
 
     rule_report = st.session_state.get("rule_report", [])
